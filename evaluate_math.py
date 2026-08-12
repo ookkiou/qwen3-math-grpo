@@ -6,12 +6,14 @@
   - 判定：sympy 数值/表达式等价，与 GRPO 奖励函数同一口径
 
 用法（与方案 bash 示例对齐）：
+  # G0 基座：base 无 chat template，裸 prompt 评测
   python evaluate_math.py --mode base --model Qwen/Qwen3-4B \
       --benchmark gsm8k --out results/g0_gsm8k.json
-  python evaluate_math.py --mode base --model merged/g2 \
-      --benchmark math500 --out results/g2_math500.json
+  # G1–G3：SFT/GRPO 以 chat 格式训练，必须加 --chat-template 保持训评一致
+  python evaluate_math.py --model merged/g2 --benchmark math500 \
+      --chat-template --out results/g2_math500.json
   python evaluate_math.py --model merged/g3 --eval data/gsm8k_test.jsonl \
-      --benchmark gsm8k --out results/g3_gsm8k.json
+      --benchmark gsm8k --chat-template --out results/g3_gsm8k.json
 """
 
 import argparse
@@ -26,12 +28,22 @@ MATH_PROMPT_TEMPLATE = (
     "请解答下面的题目，写出完整推理过程，并将最终答案放在 \\boxed{} 中。\n\n{problem}"
 )
 
+# 与 train_grpo.py 同款兜底 chat template（base 模型 tokenizer 无模板时用）
+FALLBACK_CHAT_TEMPLATE = (
+    "{% for m in messages %}{{ m['role'] + '\\n' + m['content'] + '\\n' }}"
+    "{% endfor %}"
+)
+
 
 # ---------- 答案提取与等价判定（与 train_grpo.py 同一套规则） ----------
 
+# \boxed 提取支持一层嵌套大括号（如 \boxed{\frac{1}{2}}）
+BOXED_RE = re.compile(r"\\boxed\{((?:[^{}]|\{[^{}]*\})*)\}")
+
+
 def extract_answer(text: str) -> str:
     """优先 \\boxed{}，其次'答案是/为'，最后取末尾数字。"""
-    m = re.search(r"\\boxed\{([^}]+)\}", text)
+    m = BOXED_RE.search(text)
     if m:
         return m.group(1).strip()
     m = re.search(r"答案[是为]\s*(.+?)(?:\n|$)", text)
@@ -53,16 +65,38 @@ def normalize_math(s: str) -> str:
 
 
 def is_equivalent(pred: str, truth: str) -> bool:
-    """sympy 数值等价判定，失败回退字符串比较。"""
+    """数值等价判定：字符串/浮点快速路径优先，sympy simplify 带超时防卡死。"""
     p, t = normalize_math(pred), normalize_math(truth)
     if p == t:
         return True
+    try:  # 纯数字快速路径，避免走 sympy
+        return abs(float(p) - float(t)) < 1e-6
+    except (ValueError, OverflowError):
+        pass
     try:
-        return bool(sympy.simplify(
-            sympy.sympify(p, evaluate=True) - sympy.sympify(t, evaluate=True)
-        ) == 0)
+        return _sympy_equiv(p, t)
     except Exception:
         return False
+
+
+def _sympy_equiv(p: str, t: str, timeout: float = 5.0) -> bool:
+    """sympy.simplify 对复杂表达式可能耗时很久，SIGALRM 超时保护。"""
+    expr = sympy.sympify(p, evaluate=True) - sympy.sympify(t, evaluate=True)
+    try:
+        import signal
+
+        def _handler(signum, frame):
+            raise TimeoutError("sympy.simplify timeout")
+
+        old = signal.signal(signal.SIGALRM, _handler)
+        signal.setitimer(signal.ITIMER_REAL, timeout)
+        try:
+            return bool(sympy.simplify(expr) == 0)
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, old)
+    except (AttributeError, ValueError):  # 非 Unix 或非主线程，直接调用
+        return bool(sympy.simplify(expr) == 0)
 
 
 # ---------- 数据加载 ----------
@@ -82,6 +116,20 @@ def load_eval_data(args) -> list:
         ds = load_dataset("HuggingFaceH4/MATH-500", split="test")
         return [{"problem": r["problem"], "answer": r["answer"]} for r in ds]
     raise ValueError("需要 --benchmark 或 --eval 之一")
+
+
+# ---------- prompt 格式化 ----------
+
+def apply_chat_template(prompts: list, model_path: str) -> list:
+    """SFT/GRPO 模型以 chat 格式训练，评测必须套同一模板，否则分数失真。"""
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    if tok.chat_template is None:
+        tok.chat_template = FALLBACK_CHAT_TEMPLATE
+        print("[eval] tokenizer 无 chat template，使用兜底模板")
+    return [tok.apply_chat_template(
+        [{"role": "user", "content": p}],
+        tokenize=False, add_generation_prompt=True) for p in prompts]
 
 
 # ---------- 推理后端 ----------
@@ -127,6 +175,8 @@ def main():
     ap.add_argument("--mode", default="base", help="兼容方案命令，base/merged 同口径")
     ap.add_argument("--benchmark", choices=["gsm8k", "math500"])
     ap.add_argument("--eval", default=None, help="本地评测 jsonl（优先于 --benchmark 内置集）")
+    ap.add_argument("--chat-template", action="store_true",
+                    help="用 chat template 包装 prompt（评测 SFT/GRPO 模型必须开启）")
     ap.add_argument("--out", required=True)
     ap.add_argument("--backend", choices=["vllm", "hf"], default="vllm")
     ap.add_argument("--max-new-tokens", type=int, default=1024)
@@ -138,8 +188,11 @@ def main():
 
     data = load_eval_data(args)
     prompts = [MATH_PROMPT_TEMPLATE.format(problem=r["problem"]) for r in data]
+    if args.chat_template:  # G1–G3 训评格式一致性的关键开关
+        prompts = apply_chat_template(prompts, args.model)
     print(f"[eval] {len(data)} problems from "
-          f"{args.eval or args.benchmark}, backend={args.backend}")
+          f"{args.eval or args.benchmark}, backend={args.backend}, "
+          f"chat_template={args.chat_template}")
 
     responses = (generate_vllm(prompts, args) if args.backend == "vllm"
                  else generate_hf(prompts, args))

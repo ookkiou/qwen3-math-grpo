@@ -11,7 +11,10 @@
       --prompts data/gsm8k_train_prompts.jsonl \
       --output_dir out/g3_grpo \
       --steps 500 --lr 1e-6 --beta 0.01 \
-      --group-size 8 --temperature 0.9 --max-new-tokens 512
+      --group-size 8 --temperature 0.9 --max-new-tokens 1024
+
+说明：trl GRPOTrainer 在线采样（训练时实时生成 G 条回答），无需 vLLM 预采样；
+max-new-tokens 与 evaluate_math.py 保持同口径（1024），显存不够再降并同步评测。
 """
 
 import argparse
@@ -40,9 +43,13 @@ FALLBACK_CHAT_TEMPLATE = (
 
 # ---------- 规则奖励组件（与 evaluate_math.py 同一口径） ----------
 
+# \boxed 提取支持一层嵌套大括号（如 \boxed{\frac{1}{2}}）
+BOXED_RE = re.compile(r"\\boxed\{((?:[^{}]|\{[^{}]*\})*)\}")
+
+
 def extract_answer(text: str) -> str:
     """优先 \\boxed{}，其次'答案是/为'，最后取末尾数字。"""
-    m = re.search(r"\\boxed\{([^}]+)\}", text)
+    m = BOXED_RE.search(text)
     if m:
         return m.group(1).strip()
     m = re.search(r"答案[是为]\s*(.+?)(?:\n|$)", text)
@@ -63,16 +70,38 @@ def normalize_math(s: str) -> str:
 
 
 def is_equivalent(pred: str, truth: str) -> bool:
-    """sympy 数值等价判定，失败回退字符串比较。"""
+    """数值等价判定：字符串/浮点快速路径优先（reward 高频调用，避免 sympy 拖慢训练）。"""
     p, t = normalize_math(pred), normalize_math(truth)
     if p == t:
         return True
+    try:  # 纯数字快速路径，避免走 sympy
+        return abs(float(p) - float(t)) < 1e-6
+    except (ValueError, OverflowError):
+        pass
     try:
-        return bool(sympy.simplify(
-            sympy.sympify(p, evaluate=True) - sympy.sympify(t, evaluate=True)
-        ) == 0)
+        return _sympy_equiv(p, t)
     except Exception:
         return False
+
+
+def _sympy_equiv(p: str, t: str, timeout: float = 5.0) -> bool:
+    """sympy.simplify 对复杂表达式可能耗时很久，SIGALRM 超时保护防训练卡死。"""
+    expr = sympy.sympify(p, evaluate=True) - sympy.sympify(t, evaluate=True)
+    try:
+        import signal
+
+        def _handler(signum, frame):
+            raise TimeoutError("sympy.simplify timeout")
+
+        old = signal.signal(signal.SIGALRM, _handler)
+        signal.setitimer(signal.ITIMER_REAL, timeout)
+        try:
+            return bool(sympy.simplify(expr) == 0)
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, old)
+    except (AttributeError, ValueError):  # 非 Unix 或非主线程，直接调用
+        return bool(sympy.simplify(expr) == 0)
 
 
 def has_repetition(text: str, ngram: int = 4, threshold: int = 3) -> bool:
@@ -166,7 +195,8 @@ def main():
     ap.add_argument("--beta", type=float, default=0.01, help="KL 系数")
     ap.add_argument("--group-size", type=int, default=8)
     ap.add_argument("--temperature", type=float, default=0.9)
-    ap.add_argument("--max-new-tokens", type=int, default=512)
+    ap.add_argument("--max-new-tokens", type=int, default=1024,
+                    help="与评测同口径；24G 显存不够时降为 512 并同步评测侧")
     ap.add_argument("--max-prompt-length", type=int, default=512)
     ap.add_argument("--batch-size", type=int, default=1,
                     help="每卡 prompt 数（实际生成数 = batch*group_size）")
