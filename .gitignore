@@ -34,6 +34,9 @@ events.out.tfevents.*
 ~/.cache/huggingface
 .cache/
 
+# 个人计划
+plan/
+
 # IDE / 系统
 .vscode/
 .idea/
